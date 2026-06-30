@@ -20,10 +20,15 @@ SCOPES = [
 ]
 
 MESES = {
-    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
-    5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
-    9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+    "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12
 }
+
+MESES_NOMBRE = {v: k.capitalize() for k, v in MESES.items()}
+
+# Estado temporal para confirmar borrado (en memoria)
+esperando_confirmacion = {}
 
 
 def get_worksheet():
@@ -46,59 +51,112 @@ def parse_gasto(texto):
     return monto, categoria, descripcion
 
 
-def get_resumen():
+def get_resumen(mes=None, anio=None):
     ws = get_worksheet()
     filas = ws.get_all_values()
 
     ahora = datetime.now()
-    mes_actual = ahora.month
-    anio_actual = ahora.year
+    mes_objetivo = mes if mes else ahora.month
+    anio_objetivo = anio if anio else ahora.year
 
     totales = defaultdict(float)
-    total_mes = 0.0
+    total = 0.0
 
-    for fila in filas[1:]:  # saltar encabezado
+    for fila in filas[1:]:
         if len(fila) < 3:
             continue
         try:
-            fecha_str = fila[0]
+            fecha = datetime.strptime(fila[0], "%Y-%m-%d %H:%M")
             monto = float(fila[1])
             categoria = fila[2].lower()
-
-            fecha = datetime.strptime(fecha_str, "%Y-%m-%d %H:%M")
-            if fecha.month == mes_actual and fecha.year == anio_actual:
+            if fecha.month == mes_objetivo and fecha.year == anio_objetivo:
                 totales[categoria] += monto
-                total_mes += monto
+                total += monto
         except:
             continue
 
-    if total_mes == 0:
-        return f"📭 No hay gastos registrados en {MESES[mes_actual]}."
+    nombre_mes = MESES_NOMBRE[mes_objetivo]
+    if total == 0:
+        return f"📭 No hay gastos registrados en {nombre_mes} {anio_objetivo}."
 
-    nombre_mes = MESES[mes_actual]
-    lineas = [f"📊 Resumen de {nombre_mes} {anio_actual}\n"]
+    lineas = [f"📊 Resumen de {nombre_mes} {anio_objetivo}\n"]
     for cat, monto in sorted(totales.items(), key=lambda x: -x[1]):
         lineas.append(f"🏷️ {cat}: ${monto:,.0f}")
-    lineas.append(f"\n💰 Total del mes: ${total_mes:,.0f}")
+    lineas.append(f"\n💰 Total: ${total:,.0f}")
 
     return "\n".join(lineas)
+
+
+def borrar_todo():
+    ws = get_worksheet()
+    filas = ws.get_all_values()
+    if len(filas) <= 1:
+        return "📭 No hay registros para borrar."
+    # Mantener solo la primera fila (encabezados)
+    ws.delete_rows(2, len(filas))
+    return f"🗑️ Se borraron {len(filas) - 1} registros. La planilla quedó vacía."
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     incoming_msg = request.values.get("Body", "").strip()
+    remitente = request.values.get("From", "")
     resp = MessagingResponse()
 
-    # Comando: resumen
-    if incoming_msg.lower() == "resumen":
-        try:
-            resumen = get_resumen()
-            resp.message(resumen)
-        except Exception as e:
-            resp.message(f"⚠️ Error al obtener el resumen: {str(e)}")
+    msg_lower = incoming_msg.lower()
+
+    # Confirmar borrado
+    if msg_lower == "confirmar borrado":
+        if esperando_confirmacion.get(remitente):
+            esperando_confirmacion[remitente] = False
+            try:
+                resultado = borrar_todo()
+                resp.message(resultado)
+            except Exception as e:
+                resp.message(f"⚠️ Error al borrar: {str(e)}")
+        else:
+            resp.message("No hay ningún borrado pendiente de confirmar.")
         return str(resp)
 
-    # Comando: gasto
+    # Borrar todo
+    if msg_lower == "borrar todo":
+        esperando_confirmacion[remitente] = True
+        resp.message(
+            "⚠️ *¿Estás seguro?*\n\n"
+            "Esto va a eliminar *todos* los registros de la planilla.\n\n"
+            "Respondé *confirmar borrado* para continuar, o cualquier otra cosa para cancelar."
+        )
+        return str(resp)
+
+    # Cancelar borrado si estaba esperando confirmación
+    if esperando_confirmacion.get(remitente):
+        esperando_confirmacion[remitente] = False
+
+    # Resumen del mes actual
+    if msg_lower == "resumen":
+        try:
+            resp.message(get_resumen())
+        except Exception as e:
+            resp.message(f"⚠️ Error: {str(e)}")
+        return str(resp)
+
+    # Resumen de un mes específico: "resumen enero", "resumen marzo 2025"
+    match_mes = re.match(r"^resumen\s+(\w+)(?:\s+(\d{4}))?$", msg_lower)
+    if match_mes:
+        nombre_mes = match_mes.group(1)
+        anio_str = match_mes.group(2)
+        if nombre_mes in MESES:
+            mes_num = MESES[nombre_mes]
+            anio = int(anio_str) if anio_str else datetime.now().year
+            try:
+                resp.message(get_resumen(mes=mes_num, anio=anio))
+            except Exception as e:
+                resp.message(f"⚠️ Error: {str(e)}")
+        else:
+            resp.message(f"No reconozco el mes '{nombre_mes}'. Usá el nombre en español, ej: *resumen enero*")
+        return str(resp)
+
+    # Registrar gasto
     parsed = parse_gasto(incoming_msg)
     if parsed is None:
         resp.message(
@@ -107,8 +165,13 @@ def webhook():
             "▪️ Registrar gasto:\n"
             "*gasto MONTO CATEGORIA DESCRIPCION*\n"
             "Ej: gasto 500 comida almuerzo\n\n"
-            "▪️ Ver resumen del mes:\n"
-            "*resumen*"
+            "▪️ Ver resumen del mes actual:\n"
+            "*resumen*\n\n"
+            "▪️ Ver resumen de un mes específico:\n"
+            "*resumen enero*\n"
+            "*resumen marzo 2025*\n\n"
+            "▪️ Borrar todos los registros:\n"
+            "*borrar todo*"
         )
         return str(resp)
 
